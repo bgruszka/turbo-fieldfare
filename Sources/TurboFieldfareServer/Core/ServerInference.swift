@@ -520,6 +520,10 @@ public actor ServerModelSession: ServerInferenceBackend {
     private let promptCacheDomain: ServerPromptCacheDomain
     private var promptCache = ServerPromptCache()
     private var kvLineage: ServerKVLineage?
+    /// The last prompt whose completion failed to parse. Rewinding to it would
+    /// replay the same KV and the same first token, so an identical retry
+    /// prefills along another path instead of looping on the failure.
+    private var failedPromptIDs: [Int32]?
     public nonisolated let visionCapability: String
     private let visionRuntime: VisionRuntime?
     private let visionResidencyPolicy: VisionResidencyPolicy
@@ -973,6 +977,7 @@ public actor ServerModelSession: ServerInferenceBackend {
                 effectivePromptIDs = renderedTextIDs
                 multimodalInput = nil
                 if promptCacheMode == .singlePrefix,
+                   renderedTextIDs != failedPromptIDs,
                    let lineage = kvLineage,
                    runner.continuationPosition == lineage.tokenIDs.count,
                    let target = lineage.rewindTarget(promptIDs: renderedTextIDs,
@@ -1085,7 +1090,8 @@ public actor ServerModelSession: ServerInferenceBackend {
             kind: StructuredOutputFailureKind,
             cause: StructuredOutputFailureCause
         ) -> StructuredOutputFailure {
-            StructuredOutputFailure(
+            failedPromptIDs = renderedPromptIDs
+            return StructuredOutputFailure(
                 kind: kind,
                 cause: cause,
                 diagnostics: StructuredOutputFailureDiagnostics(
@@ -1144,6 +1150,7 @@ public actor ServerModelSession: ServerInferenceBackend {
             ServerLog.promptCachePublication(publication)
         }
         completed = true
+        failedPromptIDs = nil
         return ServerCompletion(
             content: content,
             toolCalls: calls,
