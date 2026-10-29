@@ -252,6 +252,8 @@ import Metal
         }
         let snapshot = try kv.snapshotPrefix()
         #expect(snapshot.position == prefixLength)
+        // Sliding layers keep only their 1,024-row window, not the whole ring.
+        #expect(snapshot.byteCount == 25 * config.slidingWindow * 4_096 * 2 + 5 * prefixLength * 2_048 * 2)
 
         for position in prefixLength..<3_000 {
             writeMarker(kv, position: position, value: 61_000)

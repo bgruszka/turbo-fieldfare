@@ -30,7 +30,9 @@ public struct KVView: @unchecked Sendable {
 public struct KVPrefixSnapshot: @unchecked Sendable {
     public let position: Int
     let capacityTokens: [Int]
-    let rowsPerLayer: [Int]
+    /// Physical row ranges copied per layer, in copy order: one range for a
+    /// linear layer, up to two for a sliding ring window that wraps.
+    let segmentsPerLayer: [[Range<Int>]]
     let keyCopies: [MTLBuffer]
     let valueCopies: [MTLBuffer]
 
@@ -257,29 +259,52 @@ public final class KVCacheManager {
         position = newPosition
     }
 
+    /// The physical rows the current position depends on. A sliding ring
+    /// needs only its window, because every attention kernel reads
+    /// `[position - slidingWindow, position)` and never the ring slack.
+    private func dependentSegments(layer: Int) -> [Range<Int>] {
+        let capacity = capacityTokens[layer]
+        guard kinds[layer] == .swa, capacity < maxContext else {
+            return [0..<min(position, capacity)]
+        }
+        let rows = min(position, slidingWindowTokens)
+        let firstSlot = (position - rows) % capacity
+        let firstLength = min(rows, capacity - firstSlot)
+        let wrapped = rows - firstLength
+        return wrapped > 0
+            ? [firstSlot..<(firstSlot + firstLength), 0..<wrapped]
+            : [firstSlot..<(firstSlot + firstLength)]
+    }
+
     /// Copy every row the current position depends on. Callers must have
     /// waited for the GPU work that wrote them.
     public func snapshotPrefix() throws -> KVPrefixSnapshot {
         precondition(position > 0, "snapshot requires a non-empty KV")
-        var rows: [Int] = []
+        var segmentsPerLayer: [[Range<Int>]] = []
         var keyCopies: [MTLBuffer] = []
         var valueCopies: [MTLBuffer] = []
         for layer in 0..<config.numLayers {
-            let layerRows = min(position, capacityTokens[layer])
-            let length = layerRows * strides[layer]
+            let segments = dependentSegments(layer: layer)
+            let stride = strides[layer]
+            let length = segments.reduce(0) { $0 + $1.count } * stride
             guard let keyCopy = kBuffers[layer].device.makeBuffer(length: length, options: .storageModeShared),
                   let valueCopy = vBuffers[layer].device.makeBuffer(length: length, options: .storageModeShared) else {
                 throw ModelError.kvAllocationFailed(layer: layer, bytes: length)
             }
-            memcpy(keyCopy.contents(), kBuffers[layer].contents(), length)
-            memcpy(valueCopy.contents(), vBuffers[layer].contents(), length)
-            rows.append(layerRows)
+            var copied = 0
+            for segment in segments {
+                let bytes = segment.count * stride
+                memcpy(keyCopy.contents() + copied, kBuffers[layer].contents() + segment.lowerBound * stride, bytes)
+                memcpy(valueCopy.contents() + copied, vBuffers[layer].contents() + segment.lowerBound * stride, bytes)
+                copied += bytes
+            }
+            segmentsPerLayer.append(segments)
             keyCopies.append(keyCopy)
             valueCopies.append(valueCopy)
         }
         return KVPrefixSnapshot(position: position,
                                 capacityTokens: capacityTokens,
-                                rowsPerLayer: rows,
+                                segmentsPerLayer: segmentsPerLayer,
                                 keyCopies: keyCopies,
                                 valueCopies: valueCopies)
     }
@@ -290,9 +315,14 @@ public final class KVCacheManager {
         precondition(snapshot.capacityTokens == capacityTokens,
                      "snapshot was taken from a KV with different capacities")
         for layer in 0..<config.numLayers {
-            let length = snapshot.rowsPerLayer[layer] * strides[layer]
-            memcpy(kBuffers[layer].contents(), snapshot.keyCopies[layer].contents(), length)
-            memcpy(vBuffers[layer].contents(), snapshot.valueCopies[layer].contents(), length)
+            let stride = strides[layer]
+            var copied = 0
+            for segment in snapshot.segmentsPerLayer[layer] {
+                let bytes = segment.count * stride
+                memcpy(kBuffers[layer].contents() + segment.lowerBound * stride, snapshot.keyCopies[layer].contents() + copied, bytes)
+                memcpy(vBuffers[layer].contents() + segment.lowerBound * stride, snapshot.valueCopies[layer].contents() + copied, bytes)
+                copied += bytes
+            }
         }
         position = snapshot.position
         highWaterPosition = snapshot.position

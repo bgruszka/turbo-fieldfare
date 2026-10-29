@@ -197,8 +197,8 @@ that opens with the same one restores it and prefills only the rest. On a
 conversation went from 112 s to 2.2 s with identical output. The first
 conversation stores the checkpoint, and a different system turn replaces it.
 System turns under 1,024 tokens are not checkpointed. The copy costs about
-20 KB per system-turn token plus the sliding ring, about 0.5 GB for a
-10K-token system turn at the default chunk size. The server log reports
+20 KB per system-turn token for the full-attention layers plus 210 MB for the
+1,024-row sliding window, about 0.4 GB for a 10K-token system turn. The server log reports
 `prompt checkpoint stored` and `prompt checkpoint restored` with token counts.
 
 ## Tool calls

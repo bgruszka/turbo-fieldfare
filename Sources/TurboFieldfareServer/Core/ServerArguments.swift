@@ -42,9 +42,8 @@ public struct ServerArguments: Equatable, Sendable {
                                  tools) so a new conversation that opens with
                                  the same one skips its prefill (default off).
                                  Costs about 20 KB per checkpointed token plus
-                                 a copy of the sliding ring (about 270 MB at
-                                 the default chunk), about 0.5 GB for a
-                                 10K-token system turn.
+                                 210 MB for the sliding window, about 0.4 GB
+                                 for a 10K-token system turn.
       --expert-cache-slots <n>   Expert-cache slots: \(RuntimeConfiguration.allowedValueList(RuntimeConfiguration.allowedExpertCacheSlots)) (default 16).
       --expert-cache-policy <s>  Expert-cache policy: lfu or lru (default lfu).
       --prefill on|off           Enable or disable chunked prompt prefill (default on).
