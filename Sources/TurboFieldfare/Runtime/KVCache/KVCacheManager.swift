@@ -23,6 +23,22 @@ public struct KVView: @unchecked Sendable {
     public let startSlot: Int
 }
 
+/// A copy of the KV a prompt prefix left behind, taken at `position` and
+/// restorable only into the manager that produced it. Sliding layers keep only
+/// the ring rows, so this is the one way back to a prefix that later tokens
+/// have already overwritten: `rewind` cannot reach past the ring slack.
+public struct KVPrefixSnapshot: @unchecked Sendable {
+    public let position: Int
+    let capacityTokens: [Int]
+    let rowsPerLayer: [Int]
+    let keyCopies: [MTLBuffer]
+    let valueCopies: [MTLBuffer]
+
+    public var byteCount: Int {
+        keyCopies.reduce(0) { $0 + $1.length } + valueCopies.reduce(0) { $0 + $1.length }
+    }
+}
+
 /// Per-layer FP16 K/V storage for the decode loop.
 ///
 /// One K buffer and one V buffer per layer, allocated once in `init` — the
@@ -239,6 +255,47 @@ public final class KVCacheManager {
         precondition(highWaterPosition - newPosition <= maxRewindTokens,
                      "rewind to \(newPosition) exceeds ring slack \(maxRewindTokens)")
         position = newPosition
+    }
+
+    /// Copy every row the current position depends on. Callers must have
+    /// waited for the GPU work that wrote them.
+    public func snapshotPrefix() throws -> KVPrefixSnapshot {
+        precondition(position > 0, "snapshot requires a non-empty KV")
+        var rows: [Int] = []
+        var keyCopies: [MTLBuffer] = []
+        var valueCopies: [MTLBuffer] = []
+        for layer in 0..<config.numLayers {
+            let layerRows = min(position, capacityTokens[layer])
+            let length = layerRows * strides[layer]
+            guard let keyCopy = kBuffers[layer].device.makeBuffer(length: length, options: .storageModeShared),
+                  let valueCopy = vBuffers[layer].device.makeBuffer(length: length, options: .storageModeShared) else {
+                throw ModelError.kvAllocationFailed(layer: layer, bytes: length)
+            }
+            memcpy(keyCopy.contents(), kBuffers[layer].contents(), length)
+            memcpy(valueCopy.contents(), vBuffers[layer].contents(), length)
+            rows.append(layerRows)
+            keyCopies.append(keyCopy)
+            valueCopies.append(valueCopy)
+        }
+        return KVPrefixSnapshot(position: position,
+                                capacityTokens: capacityTokens,
+                                rowsPerLayer: rows,
+                                keyCopies: keyCopies,
+                                valueCopies: valueCopies)
+    }
+
+    /// Put a prefix back exactly as `snapshotPrefix` found it. Ring rows land in
+    /// the same physical slots because the capacities must match.
+    public func restorePrefix(_ snapshot: KVPrefixSnapshot) {
+        precondition(snapshot.capacityTokens == capacityTokens,
+                     "snapshot was taken from a KV with different capacities")
+        for layer in 0..<config.numLayers {
+            let length = snapshot.rowsPerLayer[layer] * strides[layer]
+            memcpy(kBuffers[layer].contents(), snapshot.keyCopies[layer].contents(), length)
+            memcpy(vBuffers[layer].contents(), snapshot.valueCopies[layer].contents(), length)
+        }
+        position = snapshot.position
+        highWaterPosition = snapshot.position
     }
 
     /// Drop all cached positions and advise the pages away.
